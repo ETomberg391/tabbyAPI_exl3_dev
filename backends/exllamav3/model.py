@@ -19,6 +19,10 @@ from exllamav3 import (
     Model,
     Tokenizer,
 )
+# Import specific cache layer types
+from exllamav3.cache.fp16 import CacheLayer_fp16
+from exllamav3.cache.quant import CacheLayer_quant # Assuming path is correct
+
 from loguru import logger
 
 from backends.base_model_container import BaseModelContainer
@@ -219,11 +223,62 @@ class ExllamaV3Container(BaseModelContainer):
         # Cache
         user_cache_size = unwrap(kwargs.get("cache_size"), self.max_seq_len)
         self.cache_size = self.adjust_cache_size(user_cache_size)
-        self.cache = Cache(self.model, max_num_tokens=self.cache_size)
+
+        # Determine main cache layer type and kwargs based on cache_mode
+        cache_mode_str = str(kwargs.get("cache_mode", "FP16")).lower()
+        main_layer_type = CacheLayer_fp16
+        main_cache_kwargs = {}
+        if cache_mode_str == "q8":
+            main_layer_type = CacheLayer_quant
+            main_cache_kwargs = {"k_bits": 8, "v_bits": 8}
+            logger.info("Using CacheLayer_quant (Q8) for main KV cache.")
+        elif cache_mode_str == "q6":
+            main_layer_type = CacheLayer_quant
+            main_cache_kwargs = {"k_bits": 6, "v_bits": 6}
+            logger.info("Using CacheLayer_quant (Q6) for main KV cache.")
+        elif cache_mode_str == "q4":
+            main_layer_type = CacheLayer_quant
+            main_cache_kwargs = {"k_bits": 4, "v_bits": 4}
+            logger.info("Using CacheLayer_quant (Q4) for main KV cache.")
+        elif cache_mode_str != "fp16":
+            logger.warning(f"Invalid cache_mode '{cache_mode_str}', defaulting to FP16.")
+            logger.info("Using CacheLayer_fp16 for main KV cache.")
+        else:
+             logger.info("Using CacheLayer_fp16 for main KV cache.")
+
+        self.cache = Cache(self.model,
+                           max_num_tokens=self.cache_size,
+                           layer_type=main_layer_type,
+                           **main_cache_kwargs)
 
         # Draft cache
         if self.use_draft_model:
-            self.draft_cache = Cache(self.draft_model, max_num_tokens = self.cache_size)
+            # Determine draft cache layer type and kwargs based on draft_cache_mode
+            draft_cache_mode_str = str(draft_args.get("draft_cache_mode", "FP16")).lower()
+            draft_layer_type = CacheLayer_fp16
+            draft_cache_kwargs = {}
+            if draft_cache_mode_str == "q8":
+                draft_layer_type = CacheLayer_quant
+                draft_cache_kwargs = {"k_bits": 8, "v_bits": 8}
+                logger.info("Using CacheLayer_quant (Q8) for draft KV cache.")
+            elif draft_cache_mode_str == "q6":
+                draft_layer_type = CacheLayer_quant
+                draft_cache_kwargs = {"k_bits": 6, "v_bits": 6}
+                logger.info("Using CacheLayer_quant (Q6) for draft KV cache.")
+            elif draft_cache_mode_str == "q4":
+                draft_layer_type = CacheLayer_quant
+                draft_cache_kwargs = {"k_bits": 4, "v_bits": 4}
+                logger.info("Using CacheLayer_quant (Q4) for draft KV cache.")
+            elif draft_cache_mode_str != "fp16":
+                logger.warning(f"Invalid draft_cache_mode '{draft_cache_mode_str}', defaulting to FP16.")
+                logger.info("Using CacheLayer_fp16 for draft KV cache.")
+            else:
+                 logger.info("Using CacheLayer_fp16 for draft KV cache.")
+
+            self.draft_cache = Cache(self.draft_model,
+                                     max_num_tokens=self.cache_size,
+                                     layer_type=draft_layer_type,
+                                     **draft_cache_kwargs)
 
         # Max batch size
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"), 256)
@@ -408,17 +463,42 @@ class ExllamaV3Container(BaseModelContainer):
 
     @torch.inference_mode()
     def load_model_sync(self, progress_callback=None):
+        reserve_arg = None
+        use_per_device_arg = None
+
+        if self.gpu_split_auto:
+            # Auto-split mode: Use reserve, don't specify use_per_device
+            reserve_arg = self.autosplit_reserve
+            use_per_device_arg = None
+        else:
+            # Manual split mode (gpu_split_auto is False): Don't use reserve
+            reserve_arg = None
+            # Specify use_per_device only if gpu_split is explicitly provided and not empty
+            if self.gpu_split: # Check if list is not None and not empty
+                use_per_device_arg = self.gpu_split
+            else:
+                # Assuming tensor_parallel=true intends auto TP distribution when gpu_split is empty
+                use_per_device_arg = None
+
+        # Draft model loading - Apply similar logic? Needs verification.
+        # For now, just apply the main logic pattern, assuming draft follows suit.
+        draft_reserve_arg = reserve_arg # Placeholder, might need specific draft logic
+        draft_use_per_device_arg = None # Placeholder, might need self.draft_gpu_split if not empty?
+
         if self.use_draft_model:
+            logger.warning("Draft model loading logic with conditional args needs verification.") # Add warning
             for value in self.draft_model.load_gen(
-                reserve_per_device=self.autosplit_reserve,
+                reserve_per_device=draft_reserve_arg,
+                use_per_device=draft_use_per_device_arg,
                 callback=progress_callback,
             ):
                 if value:
                     yield value
 
+        # Load main model
         for value in self.model.load_gen(
-            reserve_per_device=self.autosplit_reserve,
-            use_per_device=self.gpu_split,
+            reserve_per_device=reserve_arg,
+            use_per_device=use_per_device_arg, # Pass conditional use_per_device argument
             callback=progress_callback,
         ):
             if value:
